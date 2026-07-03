@@ -85,6 +85,7 @@ class VideoWidget(QWidget):
         self._show_vertical_lines = True
         self._vertical_line_xs = []
         self._vertical_line_color = (255, 0, 0, 127)
+        self._analysis_trajectory_positions: Dict[int, list] = {}
     
     def set_frame(self, frame: np.ndarray, frame_idx: int):
         """设置当前显示的帧"""
@@ -106,6 +107,13 @@ class VideoWidget(QWidget):
         current_ids = {item["id"] for item in self._footprint_points}
         if self._selected_footprint_id is not None and self._selected_footprint_id not in current_ids:
             self._selected_footprint_id = None
+        self.update()
+
+    def set_analysis_trajectory_positions(self, trajectory_positions: Dict[int, list]):
+        self._analysis_trajectory_positions = {
+            int(track_id): list(points)
+            for track_id, points in (trajectory_positions or {}).items()
+        }
         self.update()
     
     def set_fps(self, fps: int):
@@ -376,10 +384,13 @@ class VideoWidget(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             
             for track_id, track in self._tracks.items():
-                recent = track.get_recent_positions(
-                    self._current_frame_idx, 
-                    self._trajectory_frame_count
-                )
+                if self._analysis_trajectory_positions.get(track_id):
+                    recent = self._analysis_trajectory_positions[track_id]
+                else:
+                    recent = track.get_recent_positions(
+                        self._current_frame_idx, 
+                        self._trajectory_frame_count
+                    )
                 
                 if len(recent) > 1:
                     color = QColor(*track.color)

@@ -9,12 +9,18 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent, QKeySequence, QShortcut
 import cv2
 import numpy as np
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 from gui.video_widget import VideoWidget
 from gui.control_panel import ControlPanel
 from gui.init_dialog import PerspectiveCorrectionDialog
 from core.tracker import CrowdTracker, Track
+from utils.data_analysis import (
+    AnalysisError,
+    SCENE_CROWD,
+    analyze_tracks_for_scene,
+    export_analysis_xlsx,
+)
 from datetime import datetime
 import os
 
@@ -64,6 +70,7 @@ class MainWindow(QMainWindow):
         self._frame_correction_points = []
         self._footprint_points = []
         self._next_footprint_id = 1
+        self._analysis_view_track_id: Optional[int] = None
         
         self._setup_ui()
     
@@ -113,6 +120,10 @@ class MainWindow(QMainWindow):
         self.control_panel.slider_changed.connect(self._seek_frame)
         self.control_panel.goto_frame_clicked.connect(self._goto_frame)
         self.control_panel.save_results_clicked.connect(self._save_results)
+        self.control_panel.analyze_save_clicked.connect(self._save_results_with_analysis)
+        self.control_panel.analysis_view_clicked.connect(self._show_analysis_result)
+        self.control_panel.analysis_next_clicked.connect(self._show_next_analysis_result)
+        self.control_panel.analysis_view_should_clear.connect(self._on_clear_analysis_view)
         self.control_panel.clear_data_clicked.connect(self._clear_all_tracks_and_footprints)
         self.control_panel.show_points_changed.connect(self.video_widget.set_show_track_points)
         self.control_panel.show_trajectory_changed.connect(self.video_widget.set_show_trajectory)
@@ -187,6 +198,9 @@ class MainWindow(QMainWindow):
         self.control_panel.set_vertical_lines_positions([])
         self.control_panel.set_keyframe_target_track_id(None)
         self.control_panel.set_keyframe_count(0)
+        self.control_panel.set_analysis_target_track_id(None)
+        self.control_panel.clear_analysis_result_summary("未选择 track_id")
+        self._analysis_view_track_id = None
         
         # 更新追踪器
         self._tracker = CrowdTracker(fps=int(self._fps))
@@ -537,18 +551,269 @@ class MainWindow(QMainWindow):
         )
         
         # 更新视频显示
+        display_tracks = active_tracks
+        display_disappearing_tracks = disappearing_tracks
+        display_disappearing_positions = disappearing_positions
         current_positions = {}
-        for track_id, track in active_tracks.items():
-            pos = track.get_position_at(self._current_frame_idx)
-            if pos:
-                current_positions[track_id] = pos
-        
+        analysis_trajectory_positions = {}
         visible_footprints = self._get_visible_footprints(self._current_frame_idx)
-        self.video_widget.set_tracks(active_tracks, current_positions, disappearing_tracks, disappearing_positions)
+
+        if self._analysis_view_track_id is not None:
+            try:
+                analysis_payload = self._build_analysis_view_payload(self._analysis_view_track_id)
+            except AnalysisError:
+                analysis_payload = None
+            if analysis_payload is not None:
+                track = analysis_payload["track"]
+                display_tracks = {track.track_id: track}
+                display_disappearing_tracks = {}
+                display_disappearing_positions = {}
+                current_positions = analysis_payload["current_positions"]
+                visible_footprints = analysis_payload["footprints"]
+                analysis_trajectory_positions = analysis_payload["trajectory_positions"]
+            else:
+                self._analysis_view_track_id = None
+
+        if not current_positions:
+            for track_id, track in display_tracks.items():
+                pos = track.get_position_at(self._current_frame_idx)
+                if pos:
+                    current_positions[track_id] = pos
+
+        self.video_widget.set_tracks(display_tracks, current_positions, display_disappearing_tracks, display_disappearing_positions)
         self.video_widget.set_footprints(visible_footprints)
+        self.video_widget.set_analysis_trajectory_positions(analysis_trajectory_positions)
         self.video_widget.set_end_point_color(self.control_panel.get_end_point_color())
         self.control_panel.update_footprints_table(visible_footprints)
         self._refresh_keyframe_target_summary()
+
+    def _on_clear_analysis_view(self):
+        """退出分析查看模式，恢复原有跟踪显示。"""
+        if self._analysis_view_track_id is None:
+            return
+        self._analysis_view_track_id = None
+        self.video_widget.set_analysis_trajectory_positions({})
+        self.control_panel.clear_analysis_result_summary("已切换到轨迹提取，分析预览已清除")
+        self._update_display()
+
+    def _show_analysis_result(self, scene_mode: str, track_id):
+        if track_id is None:
+            self.control_panel.clear_analysis_result_summary("请输入有效的 track_id")
+            QMessageBox.information(self, "提示", "请输入有效的 track_id。")
+            return
+
+        if scene_mode == SCENE_CROWD:
+            self.control_panel.clear_analysis_result_summary("人群场景当前仅预留按单人 track_id 查看入口")
+        elif scene_mode == "queue":
+            self.control_panel.clear_analysis_result_summary("队列场景当前先按单人方式查看指定 track_id")
+
+        try:
+            payload = self._build_analysis_view_payload(int(track_id))
+        except AnalysisError as e:
+            self._analysis_view_track_id = None
+            self.video_widget.set_analysis_trajectory_positions({})
+            self.control_panel.clear_analysis_result_summary(str(e))
+            QMessageBox.information(self, "提示", str(e))
+            self._update_display()
+            return
+        if payload is None:
+            self._analysis_view_track_id = None
+            self.video_widget.set_analysis_trajectory_positions({})
+            self.control_panel.clear_analysis_result_summary(f"未找到 track_id={track_id} 的 5m 区间分析数据")
+            QMessageBox.information(self, "提示", f"未找到 track_id={track_id} 的 5m 区间分析数据。")
+            self._update_display()
+            return
+
+        self._analysis_view_track_id = int(track_id)
+        self.control_panel.set_analysis_target_track_id(track_id)
+        self.control_panel.set_analysis_result_summary(payload["summary"])
+
+        target_frame_idx = payload["start_frame"]
+        if self._cap is not None:
+            self._seek_frame(target_frame_idx)
+        else:
+            self._update_display()
+
+        self.video_widget.set_selected_track(int(track_id))
+        self.statusBar().showMessage(f"正在查看 track_id #{track_id} 的 5m 区间结果画面")
+
+    def _show_next_analysis_result(self, scene_mode: str):
+        if not self._tracker.tracks:
+            self.control_panel.clear_analysis_result_summary("当前没有轨迹数据")
+            QMessageBox.information(self, "提示", "当前没有轨迹数据。")
+            return
+
+        current_track_id = self.control_panel.get_analysis_target_track_id()
+        next_track_id = self._get_next_track_id_for_scene(scene_mode, current_track_id)
+        self.control_panel.set_analysis_target_track_id(next_track_id)
+        self._show_analysis_result(scene_mode, next_track_id)
+
+    def _get_next_track_id_for_scene(self, scene_mode: str, current_track_id) -> int:
+        ids: List[int] = []
+        try:
+            if self._fps > 0:
+                (_, _, _), analyses = analyze_tracks_for_scene(
+                    tracks=self._tracker.tracks,
+                    footprints=self._footprint_points,
+                    vertical_lines=self.video_widget.get_vertical_line_positions(),
+                    fps=self._fps,
+                )
+                ids = sorted(item.track_id for item in analyses if item.points)
+        except AnalysisError:
+            ids = []
+
+        if not ids:
+            ids = sorted(int(track_id) for track_id in self._tracker.tracks.keys())
+
+        if not ids:
+            return 1
+
+        if current_track_id is None:
+            return ids[0]
+
+        try:
+            current_track_id = int(current_track_id)
+        except (TypeError, ValueError):
+            return ids[0]
+
+        for candidate in ids:
+            if candidate > current_track_id:
+                return candidate
+        return ids[0]
+
+    def _build_analysis_view_payload(self, track_id: int):
+        track = self._tracker.tracks.get(track_id)
+        if track is None:
+            return None
+
+        (_, _, _), analyses = analyze_tracks_for_scene(
+            tracks=self._tracker.tracks,
+            footprints=self._footprint_points,
+            vertical_lines=self.video_widget.get_vertical_line_positions(),
+            fps=self._fps,
+        )
+        target_analysis = next((item for item in analyses if item.track_id == track_id), None)
+        if target_analysis is None or not target_analysis.points:
+            return None
+
+        track = self._tracker.tracks.get(track_id)
+        if track is None:
+            return None
+
+        # 画面显示扩展到 7m（4 条竖线之间），统计仍用 5m 内数据
+        vertical_lines = sorted(self.video_widget.get_vertical_line_positions())
+        if len(vertical_lines) >= 4:
+            min_x_7m = float(vertical_lines[0])
+            max_x_7m = float(vertical_lines[3])
+        else:
+            min_x_7m = min(p["x_px"] for p in target_analysis.points)
+            max_x_7m = max(p["x_px"] for p in target_analysis.points)
+
+        display_positions_7m = [
+            (frame_idx, (x_px, y_px))
+            for frame_idx, (x_px, y_px) in sorted(track.positions, key=lambda item: item[0])
+            if min_x_7m <= x_px <= max_x_7m
+        ]
+        display_footprints_7m = [
+            {
+                "id": item["id"],
+                "frame_idx": item["frame_idx"],
+                "x": item["x"],
+                "y": item["y"],
+                "color": tuple(item.get("color", (0, 255, 255))),
+                "track_id": track_id,
+            }
+            for item in self._footprint_points
+            if item.get("track_id") == track_id and min_x_7m <= item.get("x", 0.0) <= max_x_7m
+        ]
+
+        filtered_track = Track(
+            track_id=track_id,
+            positions=display_positions_7m,
+            is_manual_corrected={
+                frame_idx: value
+                for frame_idx, value in track.is_manual_corrected.items()
+                if any(point[0] == frame_idx for point in display_positions_7m)
+            },
+            color=track.color,
+            block_color=track.block_color,
+            note=track.note,
+            start_frame=track.start_frame,
+            suspicious_frames={
+                frame_idx: value
+                for frame_idx, value in track.suspicious_frames.items()
+                if any(point[0] == frame_idx for point in display_positions_7m)
+            },
+            keyframe_frames={
+                frame_idx: value
+                for frame_idx, value in track.keyframe_frames.items()
+                if any(point[0] == frame_idx for point in display_positions_7m)
+            },
+        )
+
+        trajectory_positions = {track_id: display_positions_7m}
+        current_position = filtered_track.get_position_at(self._current_frame_idx)
+        summary = {
+            "status": f"当前查看 track_id={track_id} 的 5m 区间结果",
+            "track_id": track_id,
+            "note": track.note or "null",
+            "start_frame": track.start_frame,
+            "point_count": len(target_analysis.points),
+            "mean_speed": self._format_analysis_number(target_analysis.mean_speed, "m/s"),
+            "speed_variance": self._format_analysis_number(target_analysis.speed_variance),
+            "speed_range": (
+                f"{self._format_analysis_number(target_analysis.min_speed)} ~ "
+                f"{self._format_analysis_number(target_analysis.max_speed)}"
+                if target_analysis.min_speed is not None and target_analysis.max_speed is not None
+                else "-"
+            ),
+            "footprint_count": len(target_analysis.footprints),
+            "mean_stride": self._format_analysis_number(target_analysis.mean_stride, "m"),
+            "mean_interval": self._format_analysis_number(target_analysis.mean_interval, "s"),
+            "mean_peak_valley": self._format_analysis_number(target_analysis.mean_peak_valley, "m"),
+            "mean_peak_height": self._format_analysis_number(target_analysis.mean_peak_height, "m"),
+            "track_points_text": self._build_analysis_points_text(target_analysis.points),
+            "footprints_text": self._build_analysis_footprints_text(target_analysis.footprints),
+        }
+        return {
+            "track": filtered_track,
+            "start_frame": track.start_frame,
+            "current_positions": {track_id: current_position} if current_position is not None else {},
+            "footprints": display_footprints_7m,
+            "trajectory_positions": trajectory_positions,
+            "summary": summary,
+        }
+
+    @staticmethod
+    def _format_analysis_number(value, unit: str = "") -> str:
+        if value is None:
+            return "-"
+        text = f"{float(value):.4f}"
+        return f"{text} {unit}".strip()
+
+    @staticmethod
+    def _build_analysis_points_text(points: list) -> str:
+        if not points:
+            return ""
+        lines = []
+        for point in points:
+            lines.append(
+                f"帧{point['frame_idx']} | t={point['time_s']:.4f}s | "
+                f"x={point['x_m']:.4f}m | y={point['y_m']:.4f}m"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_analysis_footprints_text(footprints: list) -> str:
+        if not footprints:
+            return ""
+        lines = []
+        for footprint in footprints:
+            lines.append(
+                f"脚印{footprint['footprint_id']} | 帧{footprint['frame_idx']} | "
+                f"t={footprint['time_s']:.4f}s | x={footprint['x_m']:.4f}m | y={footprint['y_m']:.4f}m"
+            )
+        return "\n".join(lines)
     
     def _on_pick_color_mode_changed(self, enabled: bool):
         """取色器模式切换"""
@@ -609,6 +874,11 @@ class MainWindow(QMainWindow):
             self._pick_color_mode = False
         
         self._tracker.remove_track_point(track_id)
+        if self._analysis_view_track_id == track_id:
+            self._analysis_view_track_id = None
+            self.control_panel.set_analysis_target_track_id(None)
+            self.control_panel.clear_analysis_result_summary("当前分析 track_id 已被删除")
+            self.video_widget.set_analysis_trajectory_positions({})
         
         # 如果启用了编号自动排序，重新编号
         if self._auto_sort_ids:
@@ -736,11 +1006,21 @@ class MainWindow(QMainWindow):
             success, metadata = self._tracker.import_session(file_path)
             if success:
                 self._apply_session_metadata(metadata)
+                self._analysis_view_track_id = None
+                default_track_id = min(self._tracker.tracks.keys()) if self._tracker.tracks else None
+                self.control_panel.set_analysis_target_track_id(default_track_id)
+                if default_track_id is None:
+                    self.control_panel.clear_analysis_result_summary("已载入数据，但当前没有可用的 track_id")
+                else:
+                    self.control_panel.clear_analysis_result_summary("已载入数据，可输入 track_id 查看分析结果")
+                self.video_widget.set_analysis_trajectory_positions({})
                 
                 if self._auto_sort_ids:
                     id_map = self._tracker.renumber_tracks()
                     self._remap_footprint_track_ids(id_map)
                     self.control_panel.remap_keyframe_target_ids(id_map)
+                    default_track_id = min(self._tracker.tracks.keys()) if self._tracker.tracks else None
+                    self.control_panel.set_analysis_target_track_id(default_track_id)
                 
                 latest_frame_idx = 0
                 if self._tracker.tracks:
@@ -765,6 +1045,7 @@ class MainWindow(QMainWindow):
                 self._update_display()
                 track_count = len(self._tracker.tracks)
                 has_extra = bool(self._frame_correction_points or self.video_widget.get_vertical_line_positions())
+                self.control_panel.clear_analysis_result_summary("已载入数据，可输入 track_id 查看分析结果")
                 self.statusBar().showMessage(f"已载入 {track_count} 条轨迹，并跳转到最新轨迹帧 {self._current_frame_idx}: {file_path}")
                 QMessageBox.information(
                     self,
@@ -778,52 +1059,78 @@ class MainWindow(QMainWindow):
     
     def _save_results(self):
         """保存追踪结果"""
-        metadata = self._get_session_metadata()
-        has_metadata = bool(
-            metadata["frame_correction"]["points"] or
-            metadata["vertical_lines"] or
-            self._footprint_points
-        )
-        
-        if not self._tracker.tracks and not has_metadata:
+        if not self._has_exportable_session_data():
             QMessageBox.warning(self, "警告", "没有追踪数据或校正信息可保存！")
             return
-        
-        # 生成默认文件名：完整视频名 + 日期时间
-        default_filename = ""
-        if self._video_path:
-            video_name = os.path.splitext(os.path.basename(self._video_path))[0]
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")  # 年月日时分秒
-            default_filename = f"{video_name}{timestamp}.xlsx"
-        
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存追踪结果", default_filename,
-            "Excel文件 (*.xlsx)"
-        )
-        
+
+        file_path = self._ask_export_session_path("保存追踪结果")
         if not file_path:
             return
-        
-        if not file_path.lower().endswith(".xlsx"):
-            file_path += ".xlsx"
-        
+
         try:
-            export_metadata = dict(metadata)
-            export_metadata["footprint_points"] = [
-                {
-                    "id": item["id"],
-                    "frame_idx": item["frame_idx"],
-                    "x": round(item["x"], 3),
-                    "y": round(item["y"], 3),
-                    "color": list(item["color"]),
-                    "track_id": item.get("track_id"),
-                }
-                for item in self._footprint_points
-            ]
-            self._tracker.export_session(file_path, export_metadata)
+            self._export_session_file(file_path)
             QMessageBox.information(self, "成功", f"追踪结果、脚印点、画面校正和竖线标记已保存到:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败:\n{str(e)}")
+
+    def _save_results_with_analysis(self, scene_mode: str):
+        if not self._has_exportable_session_data():
+            QMessageBox.warning(self, "警告", "没有追踪数据或校正信息可保存！")
+            return
+
+        file_path = self._ask_export_session_path("处理数据并保存文件")
+        if not file_path:
+            return
+
+        try:
+            self._export_session_file(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"原始结果保存失败:\n{str(e)}")
+            return
+
+        if scene_mode == SCENE_CROWD:
+            QMessageBox.information(
+                self,
+                "成功",
+                f"原始结果已保存到:\n{file_path}\n\n人群场景的处理数据功能后续再开发，当前未生成 Analyze 文件。"
+            )
+            self.statusBar().showMessage("已保存原始结果；人群场景暂未生成 Analyze 文件")
+            return
+
+        analyze_path = self._build_analyze_filepath(file_path)
+        try:
+            export_analysis_xlsx(
+                filepath=analyze_path,
+                tracks=self._tracker.tracks,
+                footprints=self._footprint_points,
+                vertical_lines=self.video_widget.get_vertical_line_positions(),
+                fps=self._fps,
+                scene_mode=scene_mode,
+                video_name=self._get_video_basename(),
+            )
+        except AnalysisError as e:
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"原始结果已保存到:\n{file_path}\n\n但处理数据未生成：\n{str(e)}"
+            )
+            self.statusBar().showMessage("原始结果已保存，但 Analyze 文件未生成")
+            return
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"原始结果已保存到:\n{file_path}\n\n但处理数据保存失败：\n{str(e)}"
+            )
+            self.statusBar().showMessage("原始结果已保存，但 Analyze 文件保存失败")
+            return
+
+        QMessageBox.information(
+            self,
+            "成功",
+            f"原始结果已保存到:\n{file_path}\n\n处理数据已保存到:\n{analyze_path}"
+        )
+        self.statusBar().showMessage(f"已保存原始结果和分析结果: {os.path.basename(analyze_path)}")
 
     def _clear_all_tracks_and_footprints(self):
         """清空所有轨迹和脚印，但保留画面校正与竖线标记"""
@@ -845,12 +1152,16 @@ class MainWindow(QMainWindow):
         self._footprint_points = []
         self._next_footprint_id = 1
         self._last_on_block_status = {}
+        self._analysis_view_track_id = None
         self.video_widget._selected_track_id = None
         self.video_widget._selected_footprint_id = None
         self.control_panel.set_keyframe_target_track_id(None)
         self.control_panel.set_keyframe_count(0)
+        self.control_panel.set_analysis_target_track_id(None)
+        self.control_panel.clear_analysis_result_summary("未选择 track_id")
         self.video_widget.set_tracks({}, {})
         self.video_widget.set_footprints([])
+        self.video_widget.set_analysis_trajectory_positions({})
         self._update_display()
         self.statusBar().showMessage("已清空所有轨迹和脚印，已保留画面校正与竖线标记")
     
@@ -1051,6 +1362,60 @@ class MainWindow(QMainWindow):
                 "trajectory_length_frames": self.control_panel.get_trajectory_length_frames(),
             },
         }
+
+    def _has_exportable_session_data(self) -> bool:
+        metadata = self._get_session_metadata()
+        has_metadata = bool(
+            metadata["frame_correction"]["points"] or
+            metadata["vertical_lines"] or
+            self._footprint_points
+        )
+        return bool(self._tracker.tracks or has_metadata)
+
+    def _get_default_session_filename(self) -> str:
+        if not self._video_path:
+            return ""
+        video_name = self._get_video_basename()
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        return f"{video_name}{timestamp}.xlsx"
+
+    def _get_video_basename(self) -> str:
+        if not self._video_path:
+            return ""
+        return os.path.splitext(os.path.basename(self._video_path))[0]
+
+    def _ask_export_session_path(self, title: str) -> str:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            title,
+            self._get_default_session_filename(),
+            "Excel文件 (*.xlsx)"
+        )
+        if not file_path:
+            return ""
+        if not file_path.lower().endswith(".xlsx"):
+            file_path += ".xlsx"
+        return file_path
+
+    def _export_session_file(self, file_path: str):
+        metadata = self._get_session_metadata()
+        export_metadata = dict(metadata)
+        export_metadata["footprint_points"] = [
+            {
+                "id": item["id"],
+                "frame_idx": item["frame_idx"],
+                "x": round(item["x"], 3),
+                "y": round(item["y"], 3),
+                "color": list(item["color"]),
+                "track_id": item.get("track_id"),
+            }
+            for item in self._footprint_points
+        ]
+        self._tracker.export_session(file_path, export_metadata)
+
+    def _build_analyze_filepath(self, session_file_path: str) -> str:
+        base, ext = os.path.splitext(session_file_path)
+        return f"{base}Analyze{ext or '.xlsx'}"
 
     def _apply_session_metadata(self, metadata: dict):
         display = metadata.get("display") or {}

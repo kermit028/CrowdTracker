@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QFileDialog, QGroupBox, QGridLayout,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QCheckBox, QToolButton, QColorDialog, QScrollArea, QFrame, QTabWidget,
-    QSpinBox
+    QSpinBox, QRadioButton, QTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeyEvent, QColor
@@ -65,6 +65,10 @@ class ControlPanel(QWidget):
     slider_changed = pyqtSignal(int)
     goto_frame_clicked = pyqtSignal(int)
     save_results_clicked = pyqtSignal()
+    analyze_save_clicked = pyqtSignal(str)
+    analysis_view_clicked = pyqtSignal(str, object)
+    analysis_next_clicked = pyqtSignal(str)
+    analysis_view_should_clear = pyqtSignal()
     clear_data_clicked = pyqtSignal()
     show_points_changed = pyqtSignal(bool)
     show_trajectory_changed = pyqtSignal(bool)
@@ -115,9 +119,12 @@ class ControlPanel(QWidget):
         
         page_video_scroll, page_video_layout = self._create_tab_page()
         page_track_scroll, page_track_layout = self._create_tab_page()
-        self.tab_widget.addTab(page_video_scroll, "视频信息与画面")
+        page_analysis_scroll, page_analysis_layout = self._create_tab_page()
+        self.tab_widget.addTab(page_video_scroll, "视频画面")
         self.tab_widget.addTab(page_track_scroll, "轨迹提取")
-        
+        self.tab_widget.addTab(page_analysis_scroll, "数据分析")
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+
         # ===== 视频文件（包含视频信息）=====
         self.video_file_box = CollapsibleBox("视频文件", expanded=True)
         video_layout = QVBoxLayout()
@@ -304,6 +311,25 @@ class ControlPanel(QWidget):
         
         self.correction_box.innerLayout().addLayout(correction_layout)
         page_video_layout.addWidget(self.correction_box)
+        
+        # ===== 数据读写 =====
+        self.trajectory_box = CollapsibleBox("数据读写", expanded=True)
+        trajectory_layout = QGridLayout()
+        
+        self.load_trajectory_btn = QPushButton("📂载入轨迹与画面校正")
+        self.load_trajectory_btn.clicked.connect(self.load_trajectory_clicked.emit)
+        trajectory_layout.addWidget(self.load_trajectory_btn, 0, 0)
+        
+        self.save_btn = QPushButton("💾保存结果")
+        self.save_btn.clicked.connect(self.save_results_clicked.emit)
+        trajectory_layout.addWidget(self.save_btn, 0, 1)
+
+        self.clear_data_btn = QPushButton("清空所有轨迹和脚印")
+        self.clear_data_btn.clicked.connect(self.clear_data_clicked.emit)
+        trajectory_layout.addWidget(self.clear_data_btn, 1, 0, 1, 2)
+        
+        self.trajectory_box.innerLayout().addLayout(trajectory_layout)
+        page_video_layout.addWidget(self.trajectory_box)
         
         # ===== 追踪点修改 =====
         self.edit_box = CollapsibleBox("追踪点修改", expanded=True)
@@ -569,27 +595,122 @@ class ControlPanel(QWidget):
         self.tracks_box.innerLayout().addLayout(tracks_layout)
         page_track_layout.addWidget(self.tracks_box)
         
-        # ===== 轨迹操作 =====
-        self.trajectory_box = CollapsibleBox("数据操作", expanded=True)
-        trajectory_layout = QGridLayout()
-        
-        self.load_trajectory_btn = QPushButton("📂载入轨迹与画面校正")
-        self.load_trajectory_btn.clicked.connect(self.load_trajectory_clicked.emit)
-        trajectory_layout.addWidget(self.load_trajectory_btn, 0, 0)
-        
-        self.save_btn = QPushButton("💾保存结果")
-        self.save_btn.clicked.connect(self.save_results_clicked.emit)
-        trajectory_layout.addWidget(self.save_btn, 0, 1)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(12)
+        mode_row.addWidget(QLabel("场景模式:"))
 
-        self.clear_data_btn = QPushButton("清空所有轨迹和脚印")
-        self.clear_data_btn.clicked.connect(self.clear_data_clicked.emit)
-        trajectory_layout.addWidget(self.clear_data_btn, 1, 0, 1, 2)
+        self.single_scene_radio = QRadioButton("单人场景")
+        self.single_scene_radio.setChecked(True)
+        self.single_scene_radio.toggled.connect(self._on_analysis_scene_mode_toggled)
+        mode_row.addWidget(self.single_scene_radio)
+
+        self.queue_scene_radio = QRadioButton("队列场景")
+        self.queue_scene_radio.toggled.connect(self._on_analysis_scene_mode_toggled)
+        mode_row.addWidget(self.queue_scene_radio)
+
+        self.crowd_scene_radio = QRadioButton("人群场景")
+        self.crowd_scene_radio.toggled.connect(self._on_analysis_scene_mode_toggled)
+        mode_row.addWidget(self.crowd_scene_radio)
+        mode_row.addStretch()
+        page_analysis_layout.addLayout(mode_row)
+
+        # ===== 数据处理 =====
+        self.trajectory_box = CollapsibleBox("数据处理", expanded=True)
+        trajectory_layout = QGridLayout()
+
+        process_hint = QLabel("当前分析时仅保留中间 5m 区间内的数据；人群场景暂时只保存原始结果，不生成 Analyze 文件。")
+        process_hint.setWordWrap(True)
+        process_hint.setStyleSheet("color: #666;")
+        trajectory_layout.addWidget(process_hint, 0, 0, 1, 2)
+
+        self.analyze_save_btn = QPushButton("处理数据并保存文件")
+        self.analyze_save_btn.clicked.connect(self._on_analyze_save_clicked)
+        trajectory_layout.addWidget(self.analyze_save_btn, 1, 0, 1, 2)
         
         self.trajectory_box.innerLayout().addLayout(trajectory_layout)
-        page_video_layout.addWidget(self.trajectory_box)
+        page_analysis_layout.addWidget(self.trajectory_box)
+
+        self.analysis_box = CollapsibleBox("结果画面显示", expanded=True)
+        analysis_layout = QVBoxLayout()
+        analysis_layout.setSpacing(8)
+
+        self.analysis_view_hint_label = QLabel()
+        self.analysis_view_hint_label.setWordWrap(True)
+        self.analysis_view_hint_label.setStyleSheet("color: #666;")
+        analysis_layout.addWidget(self.analysis_view_hint_label)
+
+        analysis_query_row = QHBoxLayout()
+        analysis_query_row.addWidget(QLabel("查看 track_id:"))
+        self.analysis_track_id_input = QLineEdit()
+        self.analysis_track_id_input.setPlaceholderText("输入轨迹 ID")
+        self.analysis_track_id_input.setMaxLength(6)
+        self.analysis_track_id_input.setFixedWidth(80)
+        self.analysis_track_id_input.returnPressed.connect(self._on_analysis_view_clicked)
+        analysis_query_row.addWidget(self.analysis_track_id_input)
+        self.analysis_view_btn = QPushButton("查看结果")
+        self.analysis_view_btn.clicked.connect(self._on_analysis_view_clicked)
+        analysis_query_row.addWidget(self.analysis_view_btn)
+        self.analysis_next_btn = QPushButton("查看下一个")
+        self.analysis_next_btn.clicked.connect(self._on_analysis_next_clicked)
+        analysis_query_row.addWidget(self.analysis_next_btn)
+        analysis_layout.addLayout(analysis_query_row)
+
+        self.analysis_status_label = QLabel("未选择 track_id")
+        analysis_layout.addWidget(self.analysis_status_label)
+
+        stats_grid = QGridLayout()
+        stats_grid.setSpacing(6)
+        self.analysis_track_id_value = QLabel("-")
+        self.analysis_note_value = QLabel("-")
+        self.analysis_start_frame_value = QLabel("-")
+        self.analysis_point_count_value = QLabel("-")
+        self.analysis_mean_speed_value = QLabel("-")
+        self.analysis_speed_variance_value = QLabel("-")
+        self.analysis_speed_range_value = QLabel("-")
+        self.analysis_footprint_count_value = QLabel("-")
+        self.analysis_mean_stride_value = QLabel("-")
+        self.analysis_mean_interval_value = QLabel("-")
+        self.analysis_mean_peak_valley_value = QLabel("-")
+        self.analysis_mean_peak_height_value = QLabel("-")
+
+        stats_items = [
+            ("track_id:", self.analysis_track_id_value, 0, 0),
+            ("note:", self.analysis_note_value, 0, 2),
+            ("起始帧:", self.analysis_start_frame_value, 1, 0),
+            ("轨迹点数:", self.analysis_point_count_value, 1, 2),
+            ("平均速度(m/s):", self.analysis_mean_speed_value, 2, 0),
+            ("速度方差:", self.analysis_speed_variance_value, 2, 2),
+            ("速度范围(m/s):", self.analysis_speed_range_value, 3, 0),
+            ("脚印点数:", self.analysis_footprint_count_value, 3, 2),
+            ("平均步幅(m):", self.analysis_mean_stride_value, 4, 0),
+            ("平均间隔(s):", self.analysis_mean_interval_value, 4, 2),
+            ("平均峰谷差(m):", self.analysis_mean_peak_valley_value, 5, 0),
+            ("平均峰值高度(m):", self.analysis_mean_peak_height_value, 5, 2),
+        ]
+        for text, widget, row, col in stats_items:
+            stats_grid.addWidget(QLabel(text), row, col)
+            stats_grid.addWidget(widget, row, col + 1)
+        analysis_layout.addLayout(stats_grid)
+
+        analysis_layout.addWidget(QLabel("5m 区间轨迹点:"))
+        self.analysis_track_points_text = QTextEdit()
+        self.analysis_track_points_text.setReadOnly(True)
+        self.analysis_track_points_text.setMaximumHeight(110)
+        analysis_layout.addWidget(self.analysis_track_points_text)
+
+        analysis_layout.addWidget(QLabel("5m 区间脚印点:"))
+        self.analysis_footprints_text = QTextEdit()
+        self.analysis_footprints_text.setReadOnly(True)
+        self.analysis_footprints_text.setMaximumHeight(110)
+        analysis_layout.addWidget(self.analysis_footprints_text)
+        self.analysis_box.innerLayout().addLayout(analysis_layout)
+        page_analysis_layout.addWidget(self.analysis_box)
+        self._update_analysis_scene_hint()
+        self.clear_analysis_result_summary()
         
         page_video_layout.addStretch()
         page_track_layout.addStretch()
+        page_analysis_layout.addStretch()
 
     def _create_tab_page(self):
         scroll = QScrollArea()
@@ -1014,6 +1135,93 @@ class ControlPanel(QWidget):
         self.trajectory_length_spinbox.blockSignals(True)
         self.trajectory_length_spinbox.setValue(max(1, int(frame_count)))
         self.trajectory_length_spinbox.blockSignals(False)
+
+    def get_analysis_scene_mode(self) -> str:
+        if self.queue_scene_radio.isChecked():
+            return "queue"
+        if self.crowd_scene_radio.isChecked():
+            return "crowd"
+        return "single"
+
+    def _on_analysis_scene_mode_toggled(self, checked: bool):
+        if not checked:
+            return
+        self._update_analysis_scene_hint()
+
+    def _on_tab_changed(self, index: int):
+        if index == 1:  # 轨迹提取
+            self.analysis_view_should_clear.emit()
+
+    def _on_analyze_save_clicked(self):
+        self.analyze_save_clicked.emit(self.get_analysis_scene_mode())
+
+    def _on_analysis_view_clicked(self):
+        self.analysis_view_clicked.emit(self.get_analysis_scene_mode(), self.get_analysis_target_track_id())
+
+    def _on_analysis_next_clicked(self):
+        self.analysis_next_clicked.emit(self.get_analysis_scene_mode())
+
+    def get_analysis_target_track_id(self):
+        raw = self.analysis_track_id_input.text().strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    def set_analysis_target_track_id(self, track_id):
+        text = "" if track_id is None else str(int(track_id))
+        self.analysis_track_id_input.blockSignals(True)
+        self.analysis_track_id_input.setText(text)
+        self.analysis_track_id_input.blockSignals(False)
+
+    def _update_analysis_scene_hint(self):
+        scene_mode = self.get_analysis_scene_mode()
+        if scene_mode == "single":
+            text = "单人模式下可指定 track_id，左侧显示该 ID 起始帧，并叠加 5m 区间内全部轨迹和脚印。"
+        elif scene_mode == "queue":
+            text = "队列模式下当前可先按单人方式查看指定 track_id；多人关联显示可后续扩展。"
+        else:
+            text = "人群模式下当前可先按单人方式查看指定 track_id；更多群体结果显示后续扩展。"
+        self.analysis_view_hint_label.setText(text)
+
+    def clear_analysis_result_summary(self, message: str = "未选择 track_id"):
+        self.analysis_status_label.setText(message)
+        for widget in (
+            self.analysis_track_id_value,
+            self.analysis_note_value,
+            self.analysis_start_frame_value,
+            self.analysis_point_count_value,
+            self.analysis_mean_speed_value,
+            self.analysis_speed_variance_value,
+            self.analysis_speed_range_value,
+            self.analysis_footprint_count_value,
+            self.analysis_mean_stride_value,
+            self.analysis_mean_interval_value,
+            self.analysis_mean_peak_valley_value,
+            self.analysis_mean_peak_height_value,
+        ):
+            widget.setText("-")
+        self.analysis_track_points_text.setPlainText("")
+        self.analysis_footprints_text.setPlainText("")
+
+    def set_analysis_result_summary(self, summary: dict):
+        self.analysis_status_label.setText(summary.get("status", ""))
+        self.analysis_track_id_value.setText(str(summary.get("track_id", "-")))
+        self.analysis_note_value.setText(str(summary.get("note", "-")))
+        self.analysis_start_frame_value.setText(str(summary.get("start_frame", "-")))
+        self.analysis_point_count_value.setText(str(summary.get("point_count", "-")))
+        self.analysis_mean_speed_value.setText(str(summary.get("mean_speed", "-")))
+        self.analysis_speed_variance_value.setText(str(summary.get("speed_variance", "-")))
+        self.analysis_speed_range_value.setText(str(summary.get("speed_range", "-")))
+        self.analysis_footprint_count_value.setText(str(summary.get("footprint_count", "-")))
+        self.analysis_mean_stride_value.setText(str(summary.get("mean_stride", "-")))
+        self.analysis_mean_interval_value.setText(str(summary.get("mean_interval", "-")))
+        self.analysis_mean_peak_valley_value.setText(str(summary.get("mean_peak_valley", "-")))
+        self.analysis_mean_peak_height_value.setText(str(summary.get("mean_peak_height", "-")))
+        self.analysis_track_points_text.setPlainText(summary.get("track_points_text", ""))
+        self.analysis_footprints_text.setPlainText(summary.get("footprints_text", ""))
 
     def get_navigation_step_frames(self) -> int:
         return self.navigation_step_spinbox.value()
